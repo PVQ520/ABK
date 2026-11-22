@@ -3577,6 +3577,77 @@ jobs:
 
           echo "虚拟化支持集成完成"
 
+      # ---- cgroup 资源限制 KMI 兼容补丁 (5.10 / 小米 GKI) ----
+      # 来源: Goldzxcbug/Droidspaces_Kernel_patch；须在「集成虚拟化支持」硬校验之后。
+      - name: 应用 cgroup 资源限制 KMI 补丁 (5.10)
+        if: ${{ inputs.kernel_version == '5.10' }}
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        env:
+          CGROUP_PATCH_URL: https://raw.githubusercontent.com/Goldzxcbug/Droidspaces_Kernel_patch/main/cgroup_limits/fix_cgroup_limits_kabi_5.10.272.patch
+          CVE_PATCH_URL: https://raw.githubusercontent.com/Goldzxcbug/Droidspaces_Kernel_patch/main/CVE-UserNS/cve-2026-43499-rtmutex-5.10.patch
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::cgroup KMI: $*"; exit 1; }
+
+          echo "应用 cgroup 资源限制 KMI 补丁（基线 5.10.272 -> 当前 5.10.236，同 android12-5.10 KMI）"
+
+          curl -fsSL "$CGROUP_PATCH_URL" -o "$RUNNER_TEMP/cgroup-kabi.patch" || fail "下载 cgroup 补丁失败"
+          curl -fsSL "$CVE_PATCH_URL"   -o "$RUNNER_TEMP/cve-userns.patch"  || fail "下载 CVE 补丁失败"
+
+          # 幂等：已应用过就跳过
+          if grep -qxF 'CONFIG_CFS_BANDWIDTH=y' "$DEFCONFIG"; then
+            echo "检测到 CONFIG_CFS_BANDWIDTH 已启用，跳过重复应用"
+          else
+            # 清掉历史 .rej，便于精确判断本次冲突
+            find . -name '*.rej' -delete 2>/dev/null || true
+
+            # 整包应用。gki_defconfig 的行号在 5.10.236 上可能偏移，
+            # 失败的 hunk 会生成 .rej，下面区分对待。
+            patch -p1 --forward < "$RUNNER_TEMP/cgroup-kabi.patch" || true
+
+            # 源码 hunk 必须全部干净；只有 defconfig 的 rej 可忽略（配置下面单独写）
+            while IFS= read -r rej; do
+              case "$rej" in
+                */gki_defconfig.rej|*/stock_defconfig.rej)
+                  echo "::warning::defconfig hunk 未直接应用，稍后由脚本写入配置" ;;
+                *)
+                  echo "::error::源码补丁冲突: $rej"
+                  cat "$rej"
+                  fail "cgroup 补丁与当前内核源码不匹配，请核对内核基线" ;;
+              esac
+            done < <(find . -name '*.rej' -print)
+          fi
+
+          # CVE-2026-43499：开启 CONFIG_USER_NS 后的 rtmutex 提权修复
+          if ! grep -qF 'struct task_struct *waiter_task = waiter->task' kernel/locking/rtmutex.c; then
+            patch -p1 --forward < "$RUNNER_TEMP/cve-userns.patch" || \
+              echo "::warning::CVE 补丁未干净应用，请人工检查 rtmutex.c"
+          fi
+
+          # 独立写入配置，绕开 defconfig 行号差异（补丁本身也会写，这里做幂等兜底）
+          for cfg in CONFIG_CFS_BANDWIDTH CONFIG_CGROUP_PIDS \
+                     CONFIG_CGROUP_DEVICE CONFIG_CGROUP_PERF CONFIG_CGROUP_NET_CLASSID; do
+            if grep -qxF "${cfg}=y" "$DEFCONFIG"; then
+              echo "  已启用: $cfg"
+            elif grep -qxF "# ${cfg} is not set" "$DEFCONFIG"; then
+              sed -i "s|^# ${cfg} is not set$|${cfg}=y|" "$DEFCONFIG"
+              echo "  已切换: $cfg"
+            else
+              echo "${cfg}=y" >> "$DEFCONFIG"
+              echo "  已追加: $cfg"
+            fi
+          done
+
+          # 若使用 stock_defconfig 伪装，同步写入，保证 /proc/config.gz 一致
+          stock_cfg="$(dirname "$DEFCONFIG")/stock_defconfig"
+          if [ -f "$stock_cfg" ]; then
+            for cfg in CONFIG_CFS_BANDWIDTH CONFIG_CGROUP_PIDS; do
+              grep -qxF "${cfg}=y" "$stock_cfg" || echo "${cfg}=y" >> "$stock_cfg"
+            done
+          fi
+
+          echo "cgroup 资源限制 KMI 补丁应用完成"
+
       - name: 应用 Unicode 绕过修复
         if: inputs.enable_susfs
         env:
